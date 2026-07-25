@@ -71,13 +71,11 @@ class CyrFixService : AccessibilityService(),
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         event ?: return
-        val isTikTok = TikTok.isTikTok(event.packageName)
+        val pkg = event.packageName?.toString()
+        val isTikTok = TikTok.isTikTok(pkg)
 
-        if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED &&
-            isTikTok != tiktokForeground
-        ) {
-            tiktokForeground = isTikTok
-            main.post { syncWindows() }
+        if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
+            updateForeground(isTikTok, pkg)
         }
 
         // Everything past this line reads TikTok's content only. For any other
@@ -86,6 +84,35 @@ class CyrFixService : AccessibilityService(),
 
         scheduleScan(SCAN_DEBOUNCE_MS)
     }
+
+    /**
+     * Decides whether TikTok is still the app in front.
+     *
+     * The naive version of this -- "any window state change from another
+     * package means TikTok left" -- is wrong, and visibly so: the status bar,
+     * the keyboard, toasts, volume popups and system dialogs all raise window
+     * state changes while TikTok is very much still in front. Acting on those
+     * tore the button down and rebuilt it constantly, so it flickered instead
+     * of sitting there. Transient system windows are ignored outright.
+     */
+    private fun updateForeground(isTikTok: Boolean, pkg: String?) {
+        val next = when {
+            isTikTok -> true
+            isTransientWindow(pkg) -> return
+            else -> false
+        }
+        if (next != tiktokForeground) {
+            tiktokForeground = next
+            main.post { syncWindows() }
+        }
+    }
+
+    private fun isTransientWindow(pkg: String?): Boolean =
+        pkg == null ||
+            pkg == "android" ||
+            pkg.startsWith("com.android.systemui") ||
+            pkg.contains("inputmethod") ||
+            pkg.endsWith(".ime")
 
     override fun onInterrupt() = Unit
 
@@ -213,9 +240,13 @@ class CyrFixService : AccessibilityService(),
 
         if (addView(view, params)) {
             overlay = view
-            // Keep the button above the overlay.
-            button?.let { b ->
-                buttonParams?.let { p -> runCatching { wm.removeView(b); wm.addView(b, p) } }
+            // Re-add the button so it stacks above the overlay. Handing the same
+            // View instance straight back to addView after removeView is not
+            // reliable -- the removal is still in flight, so the add throws and
+            // the button silently disappears. Build a fresh one instead.
+            if (button != null) {
+                removeButton()
+                addButton()
             }
         }
     }
