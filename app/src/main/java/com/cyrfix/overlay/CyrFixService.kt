@@ -118,7 +118,9 @@ class CyrFixService : AccessibilityService(),
             button?.isActive = prefs.active
             syncWindows()
             if (prefs.active) {
-                lastPatches = emptyList()
+                // lastPatches belongs to the scan thread; reset it there rather
+                // than racing the in-flight scan from the main thread.
+                bgHandler?.post { lastPatches = emptyList() }
                 scheduleScan(0)
             }
         }
