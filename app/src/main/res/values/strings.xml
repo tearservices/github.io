@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">CyrFix</string>
+    <string name="service_label">CyrFix — Cyrillic comment overlay</string>
+    <string name="accessibility_description">Reads the text of TikTok comments so it can redraw them in Noto Sans. Text from other apps is never read.</string>
+
+    <string name="headline">Redraws TikTok\'s Russian comments in Noto Sans, in place.</string>
+    <string name="how_it_works">No screen recording and no OCR. The comment text is read directly from TikTok\'s view hierarchy, so what you see is the real text — not a guess at what the broken glyphs said.</string>
+
+    <string name="step_service">1. Enable the accessibility service</string>
+    <string name="step_service_body">Settings → Accessibility → Installed apps → CyrFix → turn on. This is the only permission normally needed.</string>
+    <string name="open_accessibility">Open accessibility settings</string>
+
+    <string name="step_overlay">2. Draw over other apps (fallback only)</string>
+    <string name="step_overlay_body">Usually not required. Grant it only if the floating button never appears over TikTok.</string>
+    <string name="open_overlay">Open overlay permission</string>
+
+    <string name="step_use">3. Open TikTok</string>
+    <string name="step_use_body">A round Аа button appears at the edge of the screen. Drag it anywhere. Tap once to correct the comments, tap again to stop.</string>
+
+    <string name="settings_title">Settings</string>
+    <string name="backdrop_label">Comment sheet background</string>
+    <string name="backdrop_hint">Patches must be opaque to hide the original glyphs, so this has to match TikTok\'s sheet colour.</string>
+    <string name="scale_label">Text size nudge</string>
+    <string name="diagnostics_label">Diagnostic mode</string>
+    <string name="diagnostics_hint">Outlines every text node instead of redrawing it, and records what the service can see. Use this if nothing gets corrected.</string>
+    <string name="whole_screen_label">Scan the whole screen</string>
+    <string name="whole_screen_hint">Ignores the comment-sheet detection and corrects every Cyrillic string on screen.</string>
+    <string name="share_dump">Share diagnostic dump</string>
+    <string name="no_dump">No dump yet — turn on diagnostic mode, open TikTok comments, then come back.</string>
+
+    <string name="status_on">Accessibility service: ON</string>
+    <string name="status_off">Accessibility service: OFF</string>
+</resources>

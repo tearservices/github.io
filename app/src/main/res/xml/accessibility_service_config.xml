@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  packageNames is deliberately NOT set here.
+
+  Restricting it to TikTok would look better on paper, but it would also stop
+  the service from ever hearing that TikTok went to the background, which is
+  exactly when the floating button and every drawn patch have to disappear.
+  Instead the service receives window events for all packages and bails out on
+  the very first line for anything that is not TikTok. No node tree is ever
+  fetched, walked, or read for any other app. See CyrFixService.
+-->
+<accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+    android:accessibilityEventTypes="typeWindowStateChanged|typeWindowContentChanged|typeViewScrolled"
+    android:accessibilityFeedbackType="feedbackGeneric"
+    android:accessibilityFlags="flagDefault|flagIncludeNotImportantViews|flagReportViewIds"
+    android:canRetrieveWindowContent="true"
+    android:description="@string/accessibility_description"
+    android:notificationTimeout="30"
+    android:settingsActivity="com.cyrfix.overlay.MainActivity" />
