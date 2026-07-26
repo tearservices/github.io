@@ -71,6 +71,17 @@ class CyrFixService : AccessibilityService(),
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         event ?: return
+        // An exception escaping this callback takes the whole accessibility
+        // service down with it, and Android will not bring it back without the
+        // user re-enabling it by hand. Nothing in here is worth that.
+        try {
+            handleEvent(event)
+        } catch (t: Throwable) {
+            Log.e(TAG, "event handling failed", t)
+        }
+    }
+
+    private fun handleEvent(event: AccessibilityEvent) {
         val pkg = event.packageName?.toString()
         val isTikTok = TikTok.isTikTok(pkg)
 
@@ -99,7 +110,14 @@ class CyrFixService : AccessibilityService(),
         val next = when {
             isTikTok -> true
             isTransientWindow(pkg) -> return
-            else -> false
+            else -> {
+                // A single stray event is not proof TikTok left. Confirm against
+                // the window actually in front before tearing anything down; if
+                // that cannot be read right now, keep the current state rather
+                // than guessing.
+                val active = activeWindowPackage() ?: return
+                TikTok.isTikTok(active)
+            }
         }
         if (next != tiktokForeground) {
             tiktokForeground = next
@@ -107,12 +125,29 @@ class CyrFixService : AccessibilityService(),
         }
     }
 
+    /**
+     * Windows that appear over TikTok without replacing it.
+     *
+     * Our own overlays matter most here. Adding the button creates a window,
+     * which raises a window state change naming this package -- which, read
+     * naively, says "TikTok is gone". That removed the button, which let TikTok
+     * raise another event, which added it back: a self-sustaining flicker loop
+     * that ended with no button at all.
+     */
     private fun isTransientWindow(pkg: String?): Boolean =
         pkg == null ||
+            pkg == packageName ||
             pkg == "android" ||
             pkg.startsWith("com.android.systemui") ||
             pkg.contains("inputmethod") ||
             pkg.endsWith(".ime")
+
+    private fun activeWindowPackage(): String? =
+        try {
+            rootInActiveWindow?.packageName?.toString()
+        } catch (t: Throwable) {
+            null
+        }
 
     override fun onInterrupt() = Unit
 
@@ -156,12 +191,16 @@ class CyrFixService : AccessibilityService(),
     // ---------------------------------------------------------------- windows
 
     private fun syncWindows() {
-        if (tiktokForeground) addButton() else removeButton()
+        try {
+            if (tiktokForeground) addButton() else removeButton()
 
-        if (tiktokForeground && prefs.active) {
-            addOverlay()
-        } else {
-            removeOverlay()
+            if (tiktokForeground && prefs.active) {
+                addOverlay()
+            } else {
+                removeOverlay()
+            }
+        } catch (t: Throwable) {
+            Log.e(TAG, "window sync failed", t)
         }
     }
 

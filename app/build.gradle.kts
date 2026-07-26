@@ -11,16 +11,38 @@ android {
         applicationId = "com.cyrfix.overlay"
         minSdk = 26
         targetSdk = 35
-        versionCode = 1
-        versionName = "1.0"
+        // CI passes the run number so every build is a genuine upgrade rather
+        // than a same-version reinstall.
+        versionCode = (project.findProperty("cyrfixVersionCode") as String?)?.toInt() ?: 1
+        versionName = (project.findProperty("cyrfixVersionName") as String?) ?: "1.0-local"
+    }
+
+    /**
+     * A checked-in key, deliberately.
+     *
+     * AGP generates a debug keystore per machine, so every CI runner was signing
+     * with a different key. Android refuses to install an update whose signature
+     * does not match the installed app, which is why each build collided with
+     * the last and had to be uninstalled first. Pinning one key makes updates
+     * install straight over the top.
+     */
+    signingConfigs {
+        getByName("debug") {
+            storeFile = rootProject.file("keystore/cyrfix.jks")
+            storePassword = "cyrfixkey"
+            keyAlias = "cyrfix"
+            keyPassword = "cyrfixkey"
+        }
     }
 
     buildTypes {
         debug {
             isMinifyEnabled = false
+            signingConfig = signingConfigs.getByName("debug")
         }
         release {
             isMinifyEnabled = false
+            signingConfig = signingConfigs.getByName("debug")
         }
     }
 

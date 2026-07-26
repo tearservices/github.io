@@ -39,7 +39,9 @@ jobs:
       - name: Build debug APK
         run: |
           chmod +x gradlew
-          ./gradlew assembleDebug --no-daemon --stacktrace
+          ./gradlew assembleDebug --no-daemon --stacktrace \
+            -PcyrfixVersionCode=${{ github.run_number }} \
+            -PcyrfixVersionName=1.0.${{ github.run_number }}
 
       - name: Stage APK
         id: stage

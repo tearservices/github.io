@@ -34,8 +34,23 @@ in, and those rectangles update as the list scrolls.
 ## Install
 
 Every push builds an APK and publishes it to
-[Releases](../../releases). Download the `.apk` on your phone and open it —
-it is signed with the standard Android debug key, so it installs directly.
+[Releases](../../releases). Download the `.apk` on your phone and open it.
+
+### Updates install over the top
+
+Builds are signed with a fixed key checked in at `keystore/cyrfix.jks`, and
+every build gets its own `versionCode` from the CI run number. Android will
+therefore treat each new release as a normal upgrade.
+
+This is deliberate. AGP generates a debug keystore *per machine*, so each CI
+runner was signing with a different key, and Android refuses to install an
+update whose signature does not match the installed app — which is why early
+builds collided and had to be uninstalled first.
+
+The trade-off: the signing key is public, so anyone could build an APK that
+Android would accept as an update to this one. For a personal sideloaded app
+that is a fair price for being able to update from a phone. To close it, move
+the keystore into a GitHub Actions secret and drop it from the repo.
 
 Then:
 
