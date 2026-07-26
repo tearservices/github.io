@@ -45,6 +45,12 @@ class CyrFixService : AccessibilityService(),
     private var lastPatches: List<Patch> = emptyList()
     private var lastScanAt = 0L
 
+    /** Comment region from the previous scan, used to prune the next walk. */
+    private var regionHint: Rect? = null
+
+    /** How long the last tree walk actually took; drives the scan cadence. */
+    @Volatile private var lastScanDurationMs = 0L
+
     override fun onServiceConnected() {
         super.onServiceConnected()
         wm = getSystemService(WindowManager::class.java)
@@ -93,7 +99,7 @@ class CyrFixService : AccessibilityService(),
         // app we have already returned without touching its node tree.
         if (!isTikTok || !prefs.active) return
 
-        scheduleScan(SCAN_DEBOUNCE_MS)
+        scheduleScan(nextScanDelay())
     }
 
     /**
@@ -340,6 +346,20 @@ class CyrFixService : AccessibilityService(),
         h.postDelayed({ doScan() }, delayMs)
     }
 
+    /**
+     * Paces scans against what they actually cost.
+     *
+     * A fixed 60ms cadence was the wrong model. A tree walk is hundreds of IPC
+     * round trips into TikTok's process, and on a busy comment list one can take
+     * far longer than 60ms -- so scans ran effectively back to back, saturating
+     * the binder and making TikTok's own scrolling stutter. Leaving roughly half
+     * the time idle keeps the app responsive, and the ceiling guarantees the
+     * overlay still refreshes at least once a second no matter how slow the
+     * walk gets.
+     */
+    private fun nextScanDelay(): Long =
+        (lastScanDurationMs * 3 / 2).coerceIn(SCAN_MIN_INTERVAL_MS, SCAN_MAX_INTERVAL_MS)
+
     private fun doScan() {
         scanPending = false
         if (!prefs.active || !tiktokForeground) return
@@ -352,12 +372,21 @@ class CyrFixService : AccessibilityService(),
 
         try {
             val screen = screenBounds()
+            val startedAt = SystemClock.uptimeMillis()
             val result = NodeScanner.scan(
                 root = root,
                 screen = screen,
                 wholeScreen = prefs.scanWholeScreen,
-                diagnostics = prefs.diagnostics
+                diagnostics = prefs.diagnostics,
+                hintRegion = if (prefs.scanWholeScreen) null else regionHint
             )
+            lastScanDurationMs = SystemClock.uptimeMillis() - startedAt
+
+            // Keep the hint only while it is actually producing results. If a
+            // scan comes back empty the sheet has probably closed or moved, so
+            // fall back to a full-screen walk next time rather than staying
+            // pinned to a region that no longer holds anything.
+            regionHint = if (result.patches.isEmpty()) null else result.region
 
             val now = SystemClock.uptimeMillis()
             val flinging = isFlinging(lastPatches, result.patches, now - lastScanAt)
@@ -377,7 +406,12 @@ class CyrFixService : AccessibilityService(),
             // must keep scanning to notice when it settles again.
             if (flinging) scheduleScan(SETTLE_DELAY_MS)
 
-            result.dump?.let { writeDump(it) }
+            result.dump?.let {
+                writeDump(
+                    "scan took ${lastScanDurationMs}ms, next scan in ${nextScanDelay()}ms\n" +
+                        "region hint in use: ${regionHint?.toShortString() ?: "<none, full screen walk>"}\n\n" + it
+                )
+            }
         } catch (t: Throwable) {
             Log.e(TAG, "scan failed", t)
         } finally {
@@ -393,7 +427,7 @@ class CyrFixService : AccessibilityService(),
      * scrolling stays well under the threshold and tracks normally.
      */
     private fun isFlinging(previous: List<Patch>, current: List<Patch>, dtMs: Long): Boolean {
-        if (dtMs !in 1..400 || previous.isEmpty() || current.isEmpty()) return false
+        if (dtMs !in 1..1500 || previous.isEmpty() || current.isEmpty()) return false
         val byText = HashMap<String, Int>(previous.size)
         for (p in previous) byText[p.text] = p.bounds.top
         for (p in current) {
@@ -430,8 +464,11 @@ class CyrFixService : AccessibilityService(),
     companion object {
         private const val TAG = "CyrFix"
 
-        /** At most one tree walk per this many ms, even mid-fling. */
-        private const val SCAN_DEBOUNCE_MS = 60L
+        /** Floor on the gap between tree walks. */
+        private const val SCAN_MIN_INTERVAL_MS = 60L
+
+        /** Ceiling on that gap, so the overlay never drops below ~1 FPS. */
+        private const val SCAN_MAX_INTERVAL_MS = 1000L
 
         /** Follow-up scan used to notice that a fling has stopped. */
         private const val SETTLE_DELAY_MS = 110L
