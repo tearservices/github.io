@@ -67,7 +67,12 @@ jobs:
             out/*.apk \
             --title "CyrFix ${{ steps.stage.outputs.version }}" \
             --notes "$(cat <<'NOTES'
-          Debug build, signed with the standard Android debug key, so it installs directly.
+          Signed with the project's fixed key, so this installs straight over any
+          previous build. No uninstall needed.
+
+          > **Coming from v1.0.3 or earlier?** Those were signed with a throwaway
+          > per-runner key, so Android will reject this as an update. Uninstall
+          > CyrFix once, install this, and updates work normally from here on.
 
           **Install on your phone**
           1. Tap the `.apk` below to download it.
