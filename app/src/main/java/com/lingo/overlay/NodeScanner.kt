@@ -1,36 +1,44 @@
-package com.cyrfix.overlay
+package com.lingo.overlay
 
 import android.graphics.Rect
 import android.os.Build
 import android.view.accessibility.AccessibilityNodeInfo
 
 /**
- * Walks TikTok's view hierarchy and pulls out the comment text together with
+ * Walks WhatsApp's view hierarchy and pulls out the message text together with
  * the screen rectangle each string occupies.
  *
- * This is the whole reason the app needs no screen capture and no OCR: the
- * strings TikTok is rendering badly are still perfectly good strings in its
- * view tree, and the tree also tells us exactly where each one was drawn.
+ * This is why the app needs no screen capture and no OCR. Screenshotting the
+ * chat and running text recognition over it would be slower, would guess at
+ * text that is already sitting in the view tree exactly right, and would be
+ * stale the instant the list moved. The tree gives us the true string *and* the
+ * rectangle it was drawn in, and those rectangles move with the scroll.
  *
- * Cost model: every `getChild()` is an IPC round trip into TikTok's process, so
- * a scan costs roughly one round trip per node visited. Walking the whole
- * window means walking the video feed as well as the comments, and on a busy
- * screen that is slow enough to be felt. So the scan locates the comment list
- * first and then walks only that subtree, falling back to a full walk if the
- * focused one finds nothing.
+ * Cost model: every `getChild()` is an IPC round trip into WhatsApp's process,
+ * so a scan costs roughly one round trip per node visited. The scan therefore
+ * locates the conversation list first and walks only that subtree, falling back
+ * to a full walk if that finds nothing.
  */
+/**
+ * View ids WhatsApp gives the body of a message bubble. When any node on screen
+ * matches one of these we trust it exclusively and ignore every other string,
+ * which keeps timestamps, contact names and the toolbar out of the results
+ * without any guesswork.
+ */
+private val MESSAGE_ID_SUFFIXES = listOf("message_text", "conversation_text", "text_content")
+
 object NodeScanner {
 
     /** Hard ceilings so a pathological tree can never stall the scan thread. */
     private const val MAX_NODES = 1500
     private const val MAX_DEPTH = 45
 
-    /** Budget for the shallow search that locates the comment list. */
+    /** Budget for the shallow search that locates the conversation list. */
     private const val LOCATE_BUDGET = 400
     private const val LOCATE_MAX_DEPTH = 18
 
     data class Result(
-        val patches: List<Patch>,
+        val texts: List<RawText>,
         val region: Rect?,
         val dump: String?
     )
@@ -41,52 +49,54 @@ object NodeScanner {
         wholeScreen: Boolean,
         diagnostics: Boolean,
         /**
-         * Comment region from the previous scan. Only used on the full-walk
+         * Conversation region from the previous scan. Only used on the full-walk
          * path, to skip subtrees that lie entirely outside it.
          */
         hintRegion: Rect? = null
     ): Result {
         if (!wholeScreen) {
-            val container = findCommentList(root, screen)
+            val container = findConversationList(root, screen)
             if (container != null) {
                 val bounds = Rect().also { container.getBoundsInScreen(it) }
                 val harvest = harvest(container, screen, screen)
                 container.recycleCompat()
 
                 val region = Rect(bounds).apply { inset(-8, -8) }
-                val patches = build(harvest.texts, region, diagnostics)
-                if (patches.isNotEmpty()) {
+                val texts = build(harvest.texts, region, screen, diagnostics)
+                if (texts.isNotEmpty()) {
                     return Result(
-                        patches = patches,
+                        texts = texts,
                         region = region,
-                        dump = dump(diagnostics, harvest, region, screen, "focused on comment list")
+                        dump = dump(diagnostics, harvest, region, screen, "focused on conversation list")
                     )
                 }
-                // Nothing usable in there -- fall through to the full walk
-                // rather than showing the user an empty overlay.
+                // Nothing usable in there -- fall through to the full walk rather
+                // than showing the user an empty overlay.
             }
         }
 
         val harvest = harvest(root, screen, hintRegion ?: screen)
-        val region = if (wholeScreen) null else pickCommentRegion(harvest.scrollables, screen)
+        val region = if (wholeScreen) null else pickConversationRegion(harvest.scrollables, screen)
         return Result(
-            patches = build(harvest.texts, region, diagnostics),
+            texts = build(harvest.texts, region, screen, diagnostics),
             region = region,
             dump = dump(diagnostics, harvest, region, screen, "full window walk")
         )
     }
 
     /**
-     * Breadth-first search for the comment list, returning the shallowest
-     * scrollable that looks like a bottom sheet.
+     * Breadth-first search for the message list, returning the shallowest tall
+     * scrollable.
      *
      * Breadth-first matters: the list sits only a dozen or so nodes below the
-     * root, so this stops almost immediately, whereas a depth-first search
-     * would wander into the feed before finding it. The caller owns the
-     * returned node and must recycle it.
+     * root, so this stops almost immediately, whereas a depth-first search would
+     * wander deep into one bubble's subtree before finding it. The caller owns
+     * the returned node and must recycle it.
      */
-    private fun findCommentList(root: AccessibilityNodeInfo, screen: Rect): AccessibilityNodeInfo? {
-        val sheetTop = screen.top + screen.height() / 4
+    private fun findConversationList(
+        root: AccessibilityNodeInfo,
+        screen: Rect
+    ): AccessibilityNodeInfo? {
         val queue = ArrayDeque<Pair<AccessibilityNodeInfo, Int>>()
         queue.addLast(root to 0)
         var visited = 0
@@ -99,12 +109,13 @@ object NodeScanner {
             val b = Rect()
             node.getBoundsInScreen(b)
 
-            // The feed pager is scrollable and full height too, so require the
-            // container to start below the top quarter of the display.
+            // The chat occupies everything between the toolbar and the compose
+            // bar, so the list is always the tall scrollable. Requiring real
+            // height keeps this off small horizontal strips like the sticker or
+            // reaction rows, which are scrollable too.
             val isCandidate = node !== root &&
                 node.isScrollable &&
-                b.top > sheetTop &&
-                b.height() > screen.height() / 5
+                b.height() > screen.height() / 3
 
             if (isCandidate) {
                 found = node
@@ -156,7 +167,7 @@ object NodeScanner {
             val bounds = Rect()
             node.getBoundsInScreen(bounds)
 
-            if (node.isScrollable && bounds.height() > screen.height() / 5) {
+            if (node.isScrollable && bounds.height() > screen.height() / 3) {
                 scrollables.add(Rect(bounds))
             }
 
@@ -171,7 +182,8 @@ object NodeScanner {
                             text = text.toString(),
                             bounds = Rect(bounds),
                             className = node.className?.toString() ?: "?",
-                            viewId = node.viewIdResourceName ?: ""
+                            viewId = node.viewIdResourceName ?: "",
+                            editable = node.isEditable
                         )
                     )
                 }
@@ -206,19 +218,34 @@ object NodeScanner {
         return Harvest(texts, scrollables, visited)
     }
 
-    private fun build(texts: List<RawNode>, region: Rect?, diagnostics: Boolean): List<Patch> {
-        val seen = HashSet<String>(texts.size)
-        val patches = ArrayList<Patch>(texts.size)
-        for (raw in texts) {
+    private fun build(
+        nodes: List<RawNode>,
+        region: Rect?,
+        screen: Rect,
+        diagnostics: Boolean
+    ): List<RawText> {
+        // If WhatsApp is exposing message-body view ids on this build, they are a
+        // far better filter than any geometric guess -- use them and nothing else.
+        val idMatched = nodes.any { it.isMessageBody() }
+
+        val seen = HashSet<String>(nodes.size)
+        val out = ArrayList<RawText>(nodes.size)
+        for (raw in nodes) {
             if (region != null && !region.contains(raw.bounds.centerX(), raw.bounds.centerY())) continue
-            // Nothing Cyrillic means nothing to fix; leave TikTok's own pixels alone.
-            if (!diagnostics && !raw.text.hasCyrillic()) continue
+            // Never touch the compose box: the user is typing in it, and a patch
+            // would sit on top of their own half-written message.
+            if (raw.editable) continue
+            if (idMatched && !raw.isMessageBody()) continue
+            if (!diagnostics && !raw.text.looksLikeMessageText()) continue
+
             val key = "${raw.text}@${raw.bounds.toShortString()}"
             if (!seen.add(key)) continue
-            patches.add(
-                Patch(
+
+            out.add(
+                RawText(
                     text = raw.text,
                     bounds = raw.bounds,
+                    outgoing = isOutgoing(raw.bounds, screen),
                     source = if (diagnostics) {
                         "${raw.className.substringAfterLast('.')} ${raw.viewId.substringAfterLast('/')}"
                     } else {
@@ -227,13 +254,28 @@ object NodeScanner {
                 )
             )
         }
-        return patches
+        return out
+    }
+
+    /**
+     * Which side of the chat a bubble is on, and so which colour a patch over it
+     * has to be.
+     *
+     * Comparing against the middle of the screen would be wrong: a long incoming
+     * message wraps across most of the width, so its centre sits right of
+     * centre. What actually distinguishes the two is which edge the bubble is
+     * pinned to, so the gaps either side are compared instead.
+     */
+    private fun isOutgoing(bounds: Rect, screen: Rect): Boolean {
+        val leftGap = bounds.left - screen.left
+        val rightGap = screen.right - bounds.right
+        return leftGap > rightGap
     }
 
     /**
      * A node counts as text if it actually carries a string and is a leaf (or a
-     * genuine TextView). TikTok uses plenty of custom view classes, so keying
-     * purely off the class name would miss comments.
+     * genuine TextView). WhatsApp uses plenty of custom view classes, so keying
+     * purely off the class name would miss messages.
      */
     private fun isTextLeaf(node: AccessibilityNodeInfo): Boolean {
         if (node.childCount == 0) return true
@@ -242,22 +284,14 @@ object NodeScanner {
     }
 
     /**
-     * The comment sheet is a scrollable that starts partway down the screen.
-     * The feed itself is also scrollable and usually full-height, so simply
-     * taking the biggest scrollable would land on the wrong one -- we prefer
-     * containers whose top edge sits below the first quarter of the display.
+     * On the full-walk path, the conversation is the tallest scrollable. Unlike
+     * a feed there is no second full-height scroller competing with it, so the
+     * largest one is the right answer.
      */
-    private fun pickCommentRegion(scrollables: List<Rect>, screen: Rect): Rect? {
-        if (scrollables.isEmpty()) return null
-        val sheetTopCutoff = screen.top + screen.height() / 4
-
-        val sheets = scrollables.filter { it.top > sheetTopCutoff }
-        val chosen = sheets.maxByOrNull { it.width().toLong() * it.height() }
-            ?: scrollables.maxByOrNull { it.width().toLong() * it.height() }
-            ?: return null
-
-        // Grow slightly: a comment's text can extend a hair past the
-        // container's reported bounds on some builds.
+    private fun pickConversationRegion(scrollables: List<Rect>, screen: Rect): Rect? {
+        val chosen = scrollables.maxByOrNull { it.width().toLong() * it.height() } ?: return null
+        // Grow slightly: a bubble's text can extend a hair past the container's
+        // reported bounds on some builds.
         return Rect(chosen).apply { inset(-8, -8) }
     }
 
@@ -269,11 +303,13 @@ object NodeScanner {
         strategy: String
     ): String? {
         if (!enabled) return null
+        val idMatched = harvest.texts.any { it.isMessageBody() }
         return buildString {
-            appendLine("CyrFix node dump")
+            appendLine("Lingo node dump")
             appendLine("strategy=$strategy")
+            appendLine("message-id filter active=$idMatched")
             appendLine("screen=${screen.toShortString()}  nodesVisited=${harvest.visited}")
-            appendLine("chosen comment region=${region?.toShortString() ?: "<none - scanning whole screen>"}")
+            appendLine("chosen conversation region=${region?.toShortString() ?: "<none - scanning whole screen>"}")
             appendLine()
             appendLine("scrollable containers (${harvest.scrollables.size}):")
             harvest.scrollables.forEach { appendLine("  ${it.toShortString()}") }
@@ -282,8 +318,9 @@ object NodeScanner {
             harvest.texts.forEach { n ->
                 val inRegion = region == null || region.contains(n.bounds.centerX(), n.bounds.centerY())
                 appendLine(
-                    "  ${n.bounds.toShortString()} cyr=${n.text.hasCyrillic()} inRegion=$inRegion " +
-                        "class=${n.className} id=${n.viewId}"
+                    "  ${n.bounds.toShortString()} body=${n.isMessageBody()} " +
+                        "out=${isOutgoing(n.bounds, screen)} inRegion=$inRegion " +
+                        "editable=${n.editable} class=${n.className} id=${n.viewId}"
                 )
                 appendLine("      ${n.text.take(120).replace("\n", "\\n")}")
             }
@@ -294,8 +331,15 @@ object NodeScanner {
         val text: String,
         val bounds: Rect,
         val className: String,
-        val viewId: String
-    )
+        val viewId: String,
+        val editable: Boolean
+    ) {
+        fun isMessageBody(): Boolean {
+            if (viewId.isEmpty()) return false
+            val id = viewId.substringAfterLast('/')
+            return MESSAGE_ID_SUFFIXES.any { id == it }
+        }
+    }
 }
 
 /**

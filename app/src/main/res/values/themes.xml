@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <style name="Theme.CyrFix" parent="Theme.AppCompat.DayNight.NoActionBar">
-        <item name="colorPrimary">#FE2C55</item>
-        <item name="colorAccent">#FE2C55</item>
+    <style name="Theme.Lingo" parent="Theme.AppCompat.DayNight.NoActionBar">
+        <item name="colorPrimary">#075E54</item>
+        <item name="colorAccent">#25D366</item>
     </style>
 </resources>
