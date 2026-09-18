@@ -1,4 +1,4 @@
-package com.cyrfix.overlay
+package com.lingo.overlay
 
 import android.accessibilityservice.AccessibilityService
 import android.content.SharedPreferences
@@ -15,19 +15,22 @@ import android.util.Log
 import android.view.Gravity
 import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
+import android.widget.Toast
 import java.io.File
+import java.util.Locale
 import kotlin.math.abs
 
 /**
- * Owns the floating button and the correction overlay, and drives rescans off
- * TikTok's accessibility events.
+ * Owns the floating button and the translation overlay, and drives rescans off
+ * WhatsApp's accessibility events.
  *
- * Threading: every scan runs on a dedicated background thread because
- * fetching and walking a window's node tree is an IPC round trip that would
- * otherwise land on the main thread during a fling. Only the resulting patch
- * list is posted back to the UI thread.
+ * Threading: every scan runs on a dedicated background thread, because fetching
+ * and walking a window's node tree is hundreds of IPC round trips that would
+ * otherwise land on the main thread mid-fling. Translation is asynchronous on
+ * top of that and never blocks the scan -- see [TranslationEngine]. Only the
+ * finished patch list is posted back to the UI thread.
  */
-class CyrFixService : AccessibilityService(),
+class LingoService : AccessibilityService(),
     SharedPreferences.OnSharedPreferenceChangeListener {
 
     private lateinit var wm: WindowManager
@@ -40,12 +43,28 @@ class CyrFixService : AccessibilityService(),
     private var buttonParams: WindowManager.LayoutParams? = null
     private var overlay: OverlayRenderView? = null
 
-    @Volatile private var tiktokForeground = false
+    @Volatile private var engine: TranslationEngine? = null
+
+    @Volatile private var whatsappForeground = false
     @Volatile private var scanPending = false
-    private var lastPatches: List<Patch> = emptyList()
+    @Volatile private var rebuildPending = false
+
+    /**
+     * Text nodes from the last scan, kept so the overlay can be rebuilt when a
+     * pending translation lands. A rebuild is a handful of hash lookups; a
+     * rescan is a full tree walk, and there is no reason to pay for one when
+     * nothing on screen has moved.
+     */
+    private var lastRaw: List<RawText> = emptyList()
     private var lastScanAt = 0L
 
-    /** Comment region from the previous scan, used to prune the next walk. */
+    /** Hash of what the overlay is currently showing, so we never redraw a no-op. */
+    private var lastSignature = SIGNATURE_CLEARED
+
+    /** Last busy state pushed to the button, so it is not re-posted every scan. */
+    @Volatile private var lastBusy = false
+
+    /** Conversation region from the previous scan, used to prune the next walk. */
     private var regionHint: Rect? = null
 
     /** How long the last tree walk actually took; drives the scan cadence. */
@@ -57,18 +76,24 @@ class CyrFixService : AccessibilityService(),
         prefs = Prefs(this)
         prefs.registerListener(this)
 
-        // Correction always starts off; the user opts in with the button.
+        // Translation always starts off; the user opts in with the button.
         prefs.active = false
 
-        bgThread = HandlerThread("cyrfix-scan").also {
+        bgThread = HandlerThread("lingo-scan").also {
             it.start()
             bgHandler = Handler(it.looper)
         }
 
-        // The service can be enabled while TikTok is already in front, in which
-        // case no window-state event is coming -- check directly.
-        tiktokForeground = try {
-            TikTok.isTikTok(rootInActiveWindow?.packageName)
+        engine = TranslationEngine(
+            onTranslationsArrived = { scheduleRebuild() },
+            onStatus = { status -> main.post { showStatus(status) } }
+        )
+        syncEngineSettings()
+
+        // The service can be enabled while WhatsApp is already in front, in
+        // which case no window-state event is coming -- check directly.
+        whatsappForeground = try {
+            WhatsApp.isWhatsApp(rootInActiveWindow?.packageName)
         } catch (t: Throwable) {
             false
         }
@@ -89,56 +114,56 @@ class CyrFixService : AccessibilityService(),
 
     private fun handleEvent(event: AccessibilityEvent) {
         val pkg = event.packageName?.toString()
-        val isTikTok = TikTok.isTikTok(pkg)
+        val isWhatsApp = WhatsApp.isWhatsApp(pkg)
 
         if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
-            updateForeground(isTikTok, pkg)
+            updateForeground(isWhatsApp, pkg)
         }
 
-        // Everything past this line reads TikTok's content only. For any other
+        // Everything past this line reads WhatsApp's content only. For any other
         // app we have already returned without touching its node tree.
-        if (!isTikTok || !prefs.active) return
+        if (!isWhatsApp || !prefs.active) return
 
         scheduleScan(nextScanDelay())
     }
 
     /**
-     * Decides whether TikTok is still the app in front.
+     * Decides whether WhatsApp is still the app in front.
      *
-     * The naive version of this -- "any window state change from another
-     * package means TikTok left" -- is wrong, and visibly so: the status bar,
-     * the keyboard, toasts, volume popups and system dialogs all raise window
-     * state changes while TikTok is very much still in front. Acting on those
-     * tore the button down and rebuilt it constantly, so it flickered instead
-     * of sitting there. Transient system windows are ignored outright.
+     * The naive version of this -- "any window state change from another package
+     * means WhatsApp left" -- is wrong, and visibly so: the status bar, the
+     * keyboard, toasts, volume popups and system dialogs all raise window state
+     * changes while WhatsApp is very much still in front. On a messaging app the
+     * keyboard alone would do it constantly. Transient system windows are
+     * ignored outright.
      */
-    private fun updateForeground(isTikTok: Boolean, pkg: String?) {
+    private fun updateForeground(isWhatsApp: Boolean, pkg: String?) {
         val next = when {
-            isTikTok -> true
+            isWhatsApp -> true
             isTransientWindow(pkg) -> return
             else -> {
-                // A single stray event is not proof TikTok left. Confirm against
-                // the window actually in front before tearing anything down; if
-                // that cannot be read right now, keep the current state rather
-                // than guessing.
+                // A single stray event is not proof WhatsApp left. Confirm
+                // against the window actually in front before tearing anything
+                // down; if that cannot be read right now, keep the current state
+                // rather than guessing.
                 val active = activeWindowPackage() ?: return
-                TikTok.isTikTok(active)
+                WhatsApp.isWhatsApp(active)
             }
         }
-        if (next != tiktokForeground) {
-            tiktokForeground = next
+        if (next != whatsappForeground) {
+            whatsappForeground = next
             main.post { syncWindows() }
         }
     }
 
     /**
-     * Windows that appear over TikTok without replacing it.
+     * Windows that appear over WhatsApp without replacing it.
      *
      * Our own overlays matter most here. Adding the button creates a window,
      * which raises a window state change naming this package -- which, read
-     * naively, says "TikTok is gone". That removed the button, which let TikTok
-     * raise another event, which added it back: a self-sustaining flicker loop
-     * that ended with no button at all.
+     * naively, says "WhatsApp is gone". That removed the button, which let
+     * WhatsApp raise another event, which added it back: a self-sustaining
+     * flicker loop that ended with no button at all.
      */
     private fun isTransientWindow(pkg: String?): Boolean =
         pkg == null ||
@@ -176,31 +201,62 @@ class CyrFixService : AccessibilityService(),
             removeOverlay()
             removeButton()
         }
+        engine?.close()
+        engine = null
         bgThread?.quitSafely()
         bgThread = null
         bgHandler = null
     }
 
     override fun onSharedPreferenceChanged(sp: SharedPreferences?, key: String?) {
+        // Dragging the button rewrites its position on every gesture end. That
+        // is not a reason to rebuild windows or kick off a scan.
+        if (key == Prefs.KEY_BTN_X || key == Prefs.KEY_BTN_Y) return
+
         main.post {
             button?.isActive = prefs.active
             syncWindows()
+            syncEngineSettings()
             if (prefs.active) {
-                // lastPatches belongs to the scan thread; reset it there rather
-                // than racing the in-flight scan from the main thread.
-                bgHandler?.post { lastPatches = emptyList() }
+                // lastRaw belongs to the scan thread; reset it there rather than
+                // racing the in-flight scan from the main thread.
+                bgHandler?.post {
+                    lastRaw = emptyList()
+                    lastSignature = SIGNATURE_CLEARED
+                }
                 scheduleScan(0)
             }
         }
+    }
+
+    private fun syncEngineSettings() {
+        val e = engine ?: return
+        e.wifiOnly = prefs.wifiOnlyDownloads
+        e.setTarget(prefs.targetLanguage)
+    }
+
+    private fun showStatus(status: TranslationEngine.Status) {
+        val text = when (status) {
+            is TranslationEngine.Status.Downloading ->
+                getString(R.string.pack_downloading, displayName(status.language))
+            is TranslationEngine.Status.Ready ->
+                getString(R.string.pack_ready, displayName(status.language))
+            is TranslationEngine.Status.Failed ->
+                getString(R.string.pack_failed, displayName(status.language))
+        }
+        Toast.makeText(this, text, Toast.LENGTH_SHORT).show()
+        val busy = engine?.isDownloading == true
+        lastBusy = busy
+        button?.isBusy = busy
     }
 
     // ---------------------------------------------------------------- windows
 
     private fun syncWindows() {
         try {
-            if (tiktokForeground) addButton() else removeButton()
+            if (whatsappForeground) addButton() else removeButton()
 
-            if (tiktokForeground && prefs.active) {
+            if (whatsappForeground && prefs.active) {
                 addOverlay()
             } else {
                 removeOverlay()
@@ -234,6 +290,7 @@ class CyrFixService : AccessibilityService(),
             }
         )
         view.isActive = prefs.active
+        view.isBusy = engine?.isDownloading == true
 
         val screen = screenBounds()
         val params = WindowManager.LayoutParams(
@@ -285,6 +342,10 @@ class CyrFixService : AccessibilityService(),
 
         if (addView(view, params)) {
             overlay = view
+            // A new overlay starts blank, so whatever the scan thread thinks is
+            // on screen no longer is. Clear the signature or the next emit would
+            // decide nothing had changed and leave this one empty.
+            bgHandler?.post { lastSignature = SIGNATURE_CLEARED }
             // Re-add the button so it stacks above the overlay. Handing the same
             // View instance straight back to addView after removeView is not
             // reliable -- the removal is still in flight, so the add throws and
@@ -299,7 +360,6 @@ class CyrFixService : AccessibilityService(),
     private fun removeOverlay() {
         overlay?.let { runCatching { wm.removeView(it) } }
         overlay = null
-        lastPatches = emptyList()
     }
 
     private fun addView(view: android.view.View, params: WindowManager.LayoutParams): Boolean {
@@ -337,7 +397,7 @@ class CyrFixService : AccessibilityService(),
         }
     }
 
-    // ----------------------------------------------------------------- scanning
+    // ---------------------------------------------------------------- scanning
 
     private fun scheduleScan(delayMs: Long) {
         val h = bgHandler ?: return
@@ -347,22 +407,39 @@ class CyrFixService : AccessibilityService(),
     }
 
     /**
+     * Repaint from the translation cache without touching the view tree.
+     *
+     * Translations arrive in bursts -- six at a time, out of order, tens of
+     * milliseconds apart. Repainting on each one would be six layout passes for
+     * one visual change, so they are coalesced into a single rebuild.
+     */
+    private fun scheduleRebuild() {
+        val h = bgHandler ?: return
+        if (rebuildPending) return
+        rebuildPending = true
+        h.postDelayed({
+            rebuildPending = false
+            rebuild()
+        }, REBUILD_DELAY_MS)
+    }
+
+    /**
      * Paces scans against what they actually cost.
      *
-     * A fixed 60ms cadence was the wrong model. A tree walk is hundreds of IPC
-     * round trips into TikTok's process, and on a busy comment list one can take
-     * far longer than 60ms -- so scans ran effectively back to back, saturating
-     * the binder and making TikTok's own scrolling stutter. Leaving roughly half
-     * the time idle keeps the app responsive, and the ceiling guarantees the
-     * overlay still refreshes at least once a second no matter how slow the
-     * walk gets.
+     * A fixed cadence was the wrong model. A tree walk is hundreds of IPC round
+     * trips into WhatsApp's process, and on a long conversation one can take far
+     * longer than the interval -- so scans ran effectively back to back,
+     * saturating the binder and making WhatsApp's own scrolling stutter. Leaving
+     * roughly half the time idle keeps the app responsive, and the ceiling
+     * guarantees the overlay still refreshes at least once a second no matter
+     * how slow the walk gets.
      */
     private fun nextScanDelay(): Long =
         (lastScanDurationMs * 3 / 2).coerceIn(SCAN_MIN_INTERVAL_MS, SCAN_MAX_INTERVAL_MS)
 
     private fun doScan() {
         scanPending = false
-        if (!prefs.active || !tiktokForeground) return
+        if (!prefs.active || !whatsappForeground) return
 
         val root = try {
             rootInActiveWindow
@@ -383,24 +460,17 @@ class CyrFixService : AccessibilityService(),
             lastScanDurationMs = SystemClock.uptimeMillis() - startedAt
 
             // Keep the hint only while it is actually producing results. If a
-            // scan comes back empty the sheet has probably closed or moved, so
+            // scan comes back empty the conversation has probably been left, so
             // fall back to a full-screen walk next time rather than staying
             // pinned to a region that no longer holds anything.
-            regionHint = if (result.patches.isEmpty()) null else result.region
+            regionHint = if (result.texts.isEmpty()) null else result.region
 
             val now = SystemClock.uptimeMillis()
-            val flinging = isFlinging(lastPatches, result.patches, now - lastScanAt)
-            lastPatches = result.patches
+            val flinging = isFlinging(lastRaw, result.texts, now - lastScanAt)
+            lastRaw = result.texts
             lastScanAt = now
 
-            val (bg, fg) = prefs.backdrop.resolve(systemIsDark())
-            val scale = prefs.textScale
-            val diag = prefs.diagnostics
-
-            main.post {
-                val v = overlay ?: return@post
-                if (flinging) v.clear() else v.submit(result.patches, bg, fg, scale, diag)
-            }
+            emit(flinging)
 
             // While the list is moving fast we intentionally draw nothing, so we
             // must keep scanning to notice when it settles again.
@@ -409,6 +479,7 @@ class CyrFixService : AccessibilityService(),
             result.dump?.let {
                 writeDump(
                     "scan took ${lastScanDurationMs}ms, next scan in ${nextScanDelay()}ms\n" +
+                        "target language: ${prefs.targetLanguage}\n" +
                         "region hint in use: ${regionHint?.toShortString() ?: "<none, full screen walk>"}\n\n" + it
                 )
             }
@@ -419,14 +490,80 @@ class CyrFixService : AccessibilityService(),
         }
     }
 
+    private fun rebuild() {
+        if (!prefs.active || !whatsappForeground) return
+        if (lastRaw.isEmpty()) return
+        emit(flinging = false)
+    }
+
     /**
-     * A patch drawn from a scan taken 20ms ago is 40px out of place during a
+     * Turns the last scan's text nodes into patches and hands them to the
+     * overlay, skipping the hop entirely when nothing would change.
+     *
+     * Only messages whose translation is already cached become patches. One that
+     * is still being translated is left exactly as WhatsApp drew it, which is
+     * why a message never flashes as a blank coloured box before its text
+     * appears.
+     */
+    private fun emit(flinging: Boolean) {
+        val e = engine
+        val diagnostics = prefs.diagnostics
+
+        val patches = when {
+            flinging -> emptyList()
+            // In diagnostic mode we outline what the scanner saw, so nothing is
+            // translated -- no point spending the models on a debugging pass.
+            diagnostics -> lastRaw.map { Patch(it.text, it.bounds, it.outgoing, it.source) }
+            e == null -> emptyList()
+            else -> lastRaw.mapNotNull { raw ->
+                e.translate(raw.text)?.let { Patch(it, raw.bounds, raw.outgoing, raw.source) }
+            }
+        }
+
+        // Pushed ahead of the early return below: a language pack can start or
+        // finish downloading during a stretch where the overlay itself has not
+        // changed at all, and the button still has to say so.
+        val busy = e?.isDownloading == true
+        if (busy != lastBusy) {
+            lastBusy = busy
+            main.post { button?.isBusy = busy }
+        }
+
+        val signature = if (patches.isEmpty()) SIGNATURE_CLEARED else signatureOf(patches)
+        if (signature == lastSignature) return
+        lastSignature = signature
+
+        val palette = prefs.bubbleTheme.resolve(systemIsDark())
+        val scale = prefs.textScale
+
+        main.post {
+            val v = overlay ?: return@post
+            if (patches.isEmpty()) v.clear() else v.submit(patches, palette, scale, diagnostics)
+        }
+    }
+
+    private fun signatureOf(patches: List<Patch>): Int {
+        var h = 17
+        for (p in patches) {
+            h = h * 31 + p.text.hashCode()
+            h = h * 31 + p.bounds.top
+            h = h * 31 + p.bounds.left
+            h = h * 31 + p.bounds.right
+            h = h * 31 + p.bounds.bottom
+            h = h * 31 + if (p.outgoing) 1 else 0
+        }
+        // SIGNATURE_CLEARED is reserved for "showing nothing".
+        return if (h == SIGNATURE_CLEARED) h + 1 else h
+    }
+
+    /**
+     * A patch drawn from a scan taken 20 ms ago is ~40 px out of place during a
      * hard fling, which reads as smeared double text. Rather than show that, we
      * measure how far a known string travelled between two scans and hide the
      * overlay entirely while the list is moving quickly. Slow, deliberate
      * scrolling stays well under the threshold and tracks normally.
      */
-    private fun isFlinging(previous: List<Patch>, current: List<Patch>, dtMs: Long): Boolean {
+    private fun isFlinging(previous: List<RawText>, current: List<RawText>, dtMs: Long): Boolean {
         if (dtMs !in 1..1500 || previous.isEmpty() || current.isEmpty()) return false
         val byText = HashMap<String, Int>(previous.size)
         for (p in previous) byText[p.text] = p.bounds.top
@@ -437,6 +574,9 @@ class CyrFixService : AccessibilityService(),
         }
         return false
     }
+
+    private fun displayName(languageTag: String): String =
+        Locale.forLanguageTag(languageTag).displayLanguage.ifBlank { languageTag }
 
     private fun writeDump(text: String) {
         try {
@@ -462,7 +602,7 @@ class CyrFixService : AccessibilityService(),
         }
 
     companion object {
-        private const val TAG = "CyrFix"
+        private const val TAG = "Lingo"
 
         /** Floor on the gap between tree walks. */
         private const val SCAN_MIN_INTERVAL_MS = 60L
@@ -473,8 +613,14 @@ class CyrFixService : AccessibilityService(),
         /** Follow-up scan used to notice that a fling has stopped. */
         private const val SETTLE_DELAY_MS = 110L
 
+        /** Window over which arriving translations are coalesced into one repaint. */
+        private const val REBUILD_DELAY_MS = 60L
+
         /** ~1200 px/s. Above this the overlay hides instead of lagging. */
         private const val FLING_PX_PER_MS = 1.2f
+
+        /** Sentinel signature meaning "the overlay is showing nothing". */
+        private const val SIGNATURE_CLEARED = 0
 
         const val DUMP_FILE = "last_dump.txt"
     }

@@ -1,21 +1,20 @@
-package com.cyrfix.overlay
+package com.lingo.overlay
 
 import android.annotation.SuppressLint
 import android.content.Context
 import android.graphics.Canvas
-import android.graphics.Color
 import android.graphics.Paint
-import android.graphics.Typeface
+import android.graphics.RectF
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewConfiguration
-import androidx.core.content.res.ResourcesCompat
 import kotlin.math.abs
 import kotlin.math.roundToInt
+import kotlin.math.sqrt
 
 /**
- * The draggable circular button that sits over TikTok. Tap toggles correction,
- * drag repositions it (and the position is remembered).
+ * The draggable circular button that sits over WhatsApp. Tap toggles
+ * translation, drag repositions it (and the position is remembered).
  */
 @SuppressLint("ViewConstructor")
 class FloatingToggleView(
@@ -27,6 +26,19 @@ class FloatingToggleView(
 
     var isActive: Boolean = false
         set(value) {
+            if (field == value) return
+            field = value
+            invalidate()
+        }
+
+    /**
+     * True while a language pack is downloading. Shown as a colour change rather
+     * than a spinner on purpose -- an animated button would invalidate itself
+     * every frame, on top of the app whose smoothness is the whole point.
+     */
+    var isBusy: Boolean = false
+        set(value) {
+            if (field == value) return
             field = value
             invalidate()
         }
@@ -37,11 +49,13 @@ class FloatingToggleView(
         style = Paint.Style.STROKE
         strokeWidth = 1.5f * density
     }
-    private val labelPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        textAlign = Paint.Align.CENTER
-        textSize = 15f * density
-        typeface = ResourcesCompat.getFont(context, R.font.noto_sans_bold) ?: Typeface.DEFAULT_BOLD
+    private val glyphPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = 1.6f * density
+        strokeCap = Paint.Cap.ROUND
     }
+
+    private val meridian = RectF()
 
     private val slop = ViewConfiguration.get(context).scaledTouchSlop
     private var downRawX = 0f
@@ -61,15 +75,32 @@ class FloatingToggleView(
         val r = cx - ringPaint.strokeWidth
 
         bgPaint.color = if (isActive) ACTIVE_BG else IDLE_BG
-        ringPaint.color = if (isActive) ACTIVE_RING else IDLE_RING
-        labelPaint.color = if (isActive) Color.WHITE else 0xFFDDDDDD.toInt()
+        ringPaint.color = when {
+            isBusy -> BUSY_RING
+            isActive -> ACTIVE_RING
+            else -> IDLE_RING
+        }
+        glyphPaint.color = if (isActive) 0xFFFFFFFF.toInt() else 0xFFDDDDDD.toInt()
 
         canvas.drawCircle(cx, cy, r, bgPaint)
         canvas.drawCircle(cx, cy, r, ringPaint)
+        drawGlobe(canvas, cx, cy, r * 0.52f)
+    }
 
-        // Cyrillic "Aa" -- shown in the very font the button switches text to.
-        val fm = labelPaint.fontMetrics
-        canvas.drawText("Аа", cx, cy - (fm.ascent + fm.descent) / 2f, labelPaint)
+    /** A globe: outline, one meridian, and two latitude chords. */
+    private fun drawGlobe(canvas: Canvas, cx: Float, cy: Float, r: Float) {
+        canvas.drawCircle(cx, cy, r, glyphPaint)
+
+        meridian.set(cx - r * 0.48f, cy - r, cx + r * 0.48f, cy + r)
+        canvas.drawOval(meridian, glyphPaint)
+
+        canvas.drawLine(cx - r, cy, cx + r, cy, glyphPaint)
+
+        // Chord half-width at height h on a circle of radius r.
+        val h = r * 0.55f
+        val halfWidth = sqrt(r * r - h * h)
+        canvas.drawLine(cx - halfWidth, cy - h, cx + halfWidth, cy - h, glyphPaint)
+        canvas.drawLine(cx - halfWidth, cy + h, cx + halfWidth, cy + h, glyphPaint)
     }
 
     @SuppressLint("ClickableViewAccessibility")
@@ -118,8 +149,9 @@ class FloatingToggleView(
     private companion object {
         const val SIZE_DP = 46f
         val IDLE_BG = 0xB3000000.toInt()
-        val ACTIVE_BG = 0xF2FE2C55.toInt()   // TikTok red, so "on" is unmistakable
+        val ACTIVE_BG = 0xF225D366.toInt()   // WhatsApp green, so "on" is unmistakable
         val IDLE_RING = 0x66FFFFFF
         val ACTIVE_RING = 0xFFFFFFFF.toInt()
+        val BUSY_RING = 0xFFFFC107.toInt()   // amber while a language pack downloads
     }
 }

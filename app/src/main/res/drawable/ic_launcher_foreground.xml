@@ -4,11 +4,25 @@
     android:height="108dp"
     android:viewportWidth="108"
     android:viewportHeight="108">
-    <!-- Stylised "A" standing in for the Cyrillic А. -->
+    <!-- A globe: the app translates whatever language turns up. -->
     <path
-        android:fillColor="#FFFFFF"
-        android:pathData="M54,30 L40,78 L47.5,78 L50.4,68 L57.6,68 L60.5,78 L68,78 Z M54,44.5 L56.2,61.5 L51.8,61.5 Z" />
+        android:pathData="M54,30 a24,24 0 1,0 0,48 a24,24 0 1,0 0,-48"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="4" />
     <path
-        android:fillColor="#FFFFFF"
-        android:pathData="M38,82 L70,82 L70,86 L38,86 Z" />
+        android:pathData="M54,30 a12,24 0 1,0 0,48 a12,24 0 1,0 0,-48"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="3.5" />
+    <path
+        android:pathData="M30,54 L78,54"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="3.5" />
+    <path
+        android:pathData="M34,41 L74,41"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="3.5" />
+    <path
+        android:pathData="M34,67 L74,67"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="3.5" />
 </vector>
